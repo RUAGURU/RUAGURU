@@ -1,0 +1,320 @@
+# @title Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import json
+import time
+import threading
+import http.server
+import socketserver
+from urllib.robotparser import RobotFileParser
+from urllib.parse import urlparse
+
+import requests
+import markdownify
+import PIL.Image
+
+from selenium import webdriver
+from webdriver_manager.chrome import ChromeDriverManager
+
+from google import genai
+from google.genai import types
+
+from flask import Flask, request, jsonify
+from IPython.display import display, HTML, Markdown
+
+# Configuration
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+if not GOOGLE_API_KEY:
+    print("Warning: GOOGLE_API_KEY environment variable not set. API calls will likely fail.")
+    client = None
+else:
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+
+LIVE_MODEL = 'gemini-2.0-flash-live-001'
+MODEL = 'gemini-2.5-flash'
+SCREENSHOT_FILE = '/tmp/screenshot.png'
+
+# Cache for ChromeDriver path to avoid repeated downloads
+_chrome_driver_path = None
+
+def get_chrome_driver_path():
+    """Get cached ChromeDriver path or install if not cached."""
+    global _chrome_driver_path
+    if _chrome_driver_path is None:
+        _chrome_driver_path = ChromeDriverManager().install()
+    return _chrome_driver_path
+
+def show_parts(r: types.GenerateContentResponse) -> None:
+    """Helper for rendering a GenerateContentResponse object in IPython."""
+    parts = r.candidates[0].content.parts
+    if parts is None:
+        finish_reason = r.candidates[0].finish_reason
+        print(f'{finish_reason=}')
+        return
+
+    for part in parts:
+        if part.text:
+            display(Markdown(part.text))
+        elif part.executable_code:
+            display(Markdown(f'```python\n{part.executable_code.code}\n```'))
+        else:
+            print(json.dumps(part.model_dump(exclude_none=True), indent=2))
+
+    grounding_metadata = r.candidates[0].grounding_metadata
+    if grounding_metadata and grounding_metadata.search_entry_point:
+        display(HTML(grounding_metadata.search_entry_point.rendered_content))
+
+def can_crawl_url(url: str, user_agent: str = "*") -> bool:
+    """Look up robots.txt for a URL and determine if crawling is permissable.
+
+    Args:
+        url: The full URL to check.
+        user_agent: The user agent to check, defaults to any UA.
+
+    Returns:
+        True if the URL can be crawled, False otherwise.
+    """
+    try:
+        parsed_url = urlparse(url)
+        robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
+        rp = RobotFileParser(robots_url)
+        rp.read()
+        return rp.can_fetch(user_agent, url)
+    except Exception as e:
+        print(f"Error checking robots.txt for {url}: {e}")
+        return False
+
+def load_page(url: str) -> str:
+    """Load the page contents as Markdown."""
+    print(f"Attempting to load page: {url}")
+    if not can_crawl_url(url):
+        print(f"robots.txt check failed for {url}")
+        return f"URL {url} failed a robots.txt check."
+
+    try:
+        page = requests.get(url)
+        page.raise_for_status()
+        print(f"Successfully fetched {url}")
+        return markdownify.markdownify(page.content)
+    except requests.exceptions.RequestException as e:
+        print(f"Error accessing URL {url}: {e}")
+        return f"Error accessing URL: {e}"
+    except Exception as e:
+        print(f"An unexpected error occurred loading URL {url}: {e}")
+        return f"An unexpected error occurred: {e}"
+
+def browse_url(url: str) -> str:
+    """Captures a screenshot of the webpage at the provided URL.
+
+    A graphical browser will be used to connect to the URL provided,
+    and generate a screenshot of the rendered web page.
+
+    Args:
+        url: The full absolute URL to browse/screenshot.
+
+    Returns:
+        Markdown content of the page source, or error messages.
+    """
+    print(f"Attempting to browse URL: {url}")
+    if not can_crawl_url(url):
+        print(f"robots.txt check failed for {url}")
+        return f"URL {url} failed a robots.txt check."
+
+    driver = None
+    try:
+        chrome_options = webdriver.ChromeOptions()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+
+        # Use cached ChromeDriver path for efficiency
+        driver_path = get_chrome_driver_path()
+        driver = webdriver.Chrome(driver_path, options=chrome_options)
+
+        driver.set_window_size(1024, 2048)
+        driver.get(url)
+        time.sleep(5)
+        driver.save_screenshot(SCREENSHOT_FILE)
+
+        print(f"Screenshot saved to {SCREENSHOT_FILE}")
+        return markdownify.markdownify(driver.page_source)
+
+    except Exception as e:
+        print(f"An error occurred browsing URL {url}: {e}")
+        if driver:
+            driver.quit()
+        return str(e)
+    finally:
+        if driver:
+            driver.quit()
+        print(f"Finished browsing URL: {url}")
+
+async def stream_response(stream, *, tool=None):
+    """Handle a live streamed response, printing out text and issue tool calls."""
+    all_responses = []
+
+    async for msg in stream.receive():
+        all_responses.append(msg)
+
+        if text := msg.text:
+            print(text, end='')
+        elif tool_call := msg.tool_call:
+            for fc in tool_call.function_calls:
+                print(f'< Tool call', fc.model_dump(exclude_none=True))
+
+                if tool:
+                    assert fc.name == tool.__name__, "Unknown tool call encountered"
+                    tool_result = tool(**fc.args)
+                else:
+                    tool_result = 'ok'
+
+                tool_response = types.LiveClientToolResponse(
+                    function_responses=[types.FunctionResponse(
+                        name=fc.name,
+                        id=fc.id,
+                        response={'result': tool_result},
+                    )]
+                )
+                await stream.send(input=tool_response)
+
+    return all_responses
+
+# Flask Application Setup
+app = Flask(__name__)
+
+@app.route('/chat', methods=['POST'])
+def chat_endpoint():
+    user_input = request.json.get('message')
+    if not user_input:
+        return jsonify({"error": "No message provided"}), 400
+
+    if client is None:
+        return jsonify({"error": "API key not configured, cannot process chat."}), 500
+
+    # Define tool declarations here to avoid repeated creation
+    load_page_def = types.Tool(functionDeclarations=[
+        types.FunctionDeclaration.from_callable(client=client, callable=load_page)]).model_dump(exclude_none=True)
+
+    browse_tool_def = types.Tool(functionDeclarations=[
+        types.FunctionDeclaration.from_callable(client=client, callable=browse_url)]).model_dump(exclude_none=True)
+
+    sys_int = """You are an AI assistant with access to web browsing tools.
+Use the `load_page` tool to get the text content of a webpage.
+Use the `browse_url` tool to visually browse a webpage and get its text content.
+When a user asks about web content, first determine the most relevant URL, tell the user the URL, and then invoke the appropriate tool (`load_page` or `browse_url`).
+After the tool provides the content, use it to answer the user's question.
+If the `browse_url` tool is used, acknowledge that a screenshot was taken, but focus on answering the question based on the text content returned by the tool.
+"""
+
+    try:
+        chat = client.chats.create(
+            model=MODEL,
+            config={'tools': [load_page_def, browse_tool_def], 'system_instruction': sys_int}
+        )
+
+        response = chat.send_message(user_input)
+
+        tool_calls = []
+        model_text = ""
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    model_text += part.text + "\n"
+                elif part.function_call:
+                    tool_calls.append(part.function_call)
+
+        if tool_calls:
+            executed_tool_response = None
+            executed_tool_name = None
+            executed_tool_args = None
+            executed_tool_error = None
+            screenshot_available = False
+
+            first_tool_call = tool_calls[0]
+            executed_tool_name = first_tool_call.name
+            executed_tool_args = first_tool_call.args
+
+            try:
+                if executed_tool_name == 'load_page':
+                    executed_tool_response = load_page(**executed_tool_args)
+                elif executed_tool_name == 'browse_url':
+                    executed_tool_response = browse_url(**executed_tool_args)
+                    if os.path.exists(SCREENSHOT_FILE):
+                        screenshot_available = True
+                else:
+                    executed_tool_error = f"Unknown tool: {executed_tool_name}"
+                    print(executed_tool_error)
+
+            except Exception as e:
+                executed_tool_error = f"Error executing tool {executed_tool_name}: {e}"
+                print(executed_tool_error)
+
+            response_data = {
+                "model_response": model_text.strip(),
+                "tool_calls_requested": [tc.model_dump(exclude_none=True) for tc in tool_calls],
+                "executed_tool": executed_tool_name,
+                "executed_tool_args": executed_tool_args,
+                "executed_tool_response_preview": executed_tool_response[:500] if executed_tool_response else None,
+                "executed_tool_error": executed_tool_error,
+                "screenshot_saved_temp": screenshot_available
+            }
+        else:
+            response_data = {
+                "model_response": model_text.strip()
+            }
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        print(f"An error occurred during chat processing: {e}")
+        return jsonify({"error": f"An internal error occurred: {e}"}), 500
+
+@app.route('/')
+def index():
+    return "Web Browsing Tool API is running. Use the /chat endpoint with a POST request."
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    print(f"Starting Flask app on port {port}")
+    app.run(host='0.0.0.0', port=port)
+
+# Example usage configurations
+config = {
+    'response_modalities': ['TEXT'],
+    'tools': [
+        {'google_search': {}},
+    ],
+}
+
+# Deployment configurations for Cloud Run
+requirements_content = """
+flask
+google-genai
+requests
+markdownify
+selenium
+webdriver-manager
+"""
+
+dockerfile_content = """
+FROM python:3.9-slim-buster
+WORKDIR /app
+RUN apt-get update && apt-get install -y chromium chromium-driver --no-install-recommends && rm -rf /var/lib/apt/lists/*
+COPY . /app
+RUN pip install --no-cache-dir -r requirements.txt gunicorn
+EXPOSE 8080
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
+"""
+
+print("Optimized Browser Tool API - Code duplication removed and ChromeDriver caching implemented")
